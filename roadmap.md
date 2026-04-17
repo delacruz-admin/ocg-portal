@@ -5,6 +5,7 @@
 The OCG Timecard Analyzer is a web application for Cooley LLP that allows attorneys and billing staff to validate timecard entries against Outside Counsel Guidelines (OCGs) using AI. Users select a pre-indexed OCG, enter one or more timecard line-items (description + hours), and receive per-entry feedback on whether the work is likely billable — with citations to specific OCG clauses. A conversational chat interface also allows free-form Q&A about the selected OCG.
 
 Live URL: `https://d19dntnemluddo.cloudfront.net`
+GitHub: `https://github.com/delacruz-admin/ocg-portal`
 
 ---
 
@@ -39,7 +40,8 @@ ocg-portal/
 │   ├── variables.tf                   # Input variables with defaults
 │   ├── outputs.tf                     # Stack outputs (URLs, IDs)
 │   ├── backend.tf                     # S3 remote state + DynamoDB locking
-│   └── dev.tfvars                     # Dev environment overrides
+│   ├── dev.tfvars                     # Dev environment overrides (Cognito URLs)
+│   └── _seed_ocg.json                 # DynamoDB seed data for sample OCGs
 ├── .gitignore
 ├── README.md
 └── roadmap.md                         # This file
@@ -59,11 +61,11 @@ All infrastructure is serverless, defined in Terraform, and deployed to `us-east
 | Lambda | Function | `ocg-portal-list-ocgs` | Returns list of available OCGs |
 | Lambda | Function | `ocg-portal-analyze-timecard` | Analyzes timecard entries via Bedrock |
 | Lambda | Function | `ocg-portal-chat-ocg` | Conversational OCG Q&A via Bedrock |
-| API Gateway | REST API | `ocg-portal-api` | HTTP endpoints with Cognito auth |
-| Cognito | User Pool | `ocg-portal-users` | Email-based authentication |
-| Cognito | App Client | `ocg-portal-web` | Implicit OAuth flow, no secret |
+| API Gateway | REST API | `ocg-portal-api` (`lomyk2u8sa`) | HTTP endpoints with Cognito auth |
+| Cognito | User Pool | `ocg-portal-users` (`us-east-1_hcp3OqFzD`) | Email-based authentication |
+| Cognito | App Client | `ocg-portal-web` (`43qii8es4oimqtlfkigffb734o`) | Implicit OAuth flow, no secret |
 | Cognito | Domain | `ocg-portal` | Hosted UI login page |
-| S3 | Bucket | `ocg-portal-frontend-{account_id}` | Static frontend hosting |
+| S3 | Bucket | `ocg-portal-frontend-173051740680` | Static frontend hosting |
 | CloudFront | Distribution | `E1F2SJ94LZF781` | HTTPS CDN with SPA fallback |
 | IAM | Role | `ocg-portal-lambda-exec` | Shared Lambda execution role |
 
@@ -93,7 +95,7 @@ Per-resource `Component` tags: `data`, `api`, `auth`, `frontend`.
 
 Base URL: `https://lomyk2u8sa.execute-api.us-east-1.amazonaws.com/prod`
 
-All endpoints (except OPTIONS) require a Cognito JWT in the `Authorization` header.
+All endpoints (except OPTIONS) require a Cognito JWT in the `Authorization` header (raw token, no `Bearer` prefix).
 
 ### GET /ocgs
 
@@ -157,10 +159,10 @@ Request:
 }
 ```
 
-Response:
+Response (structured format — summary, optional bullets, citation on last line):
 ```json
 {
-  "reply": "According to the OCG, the following are non-billable: ...\n\n📎 Section 6.1(a) — Non-Billable Internal Activities"
+  "reply": "The OCG lists several categories of non-billable work.\n\n• Internal firm meetings not related to the matter\n• Invoice preparation and conflicts checks\n• File organization and administrative tasks\n• Training of junior associates on general skills\n\n📎 Section 6.1(a) — Non-Billable Internal Activities"
 }
 ```
 
@@ -174,6 +176,10 @@ All three resource paths (`/ocgs`, `/analyze`, `/chat`) have OPTIONS methods wit
 - `Access-Control-Allow-Origin: *`
 
 Integration responses for OPTIONS use `depends_on` to avoid race conditions with method responses during Terraform apply.
+
+### API Gateway Deployment
+
+The `aws_api_gateway_deployment` resource uses a `triggers` block with a SHA1 hash of all integration and method resource IDs. This forces Terraform to create a new deployment whenever any route configuration changes, preventing stale deployments where new routes (like `/chat`) exist in the config but aren't deployed to the live stage. The resource also uses `lifecycle { create_before_destroy = true }` to avoid downtime.
 
 ---
 
@@ -191,9 +197,9 @@ Integration responses for OPTIONS use `depends_on` to avoid race conditions with
 
 ### Bedrock Integration
 
-Both `analyze_timecard` and `chat_ocg` use the Bedrock Converse API (`bedrock.converse()`), not the legacy `invoke_model` with `inputText`. This is required for Amazon Nova models.
+Both `analyze_timecard` and `chat_ocg` use the **Bedrock Converse API** (`bedrock.converse()`), not the legacy `invoke_model` with `inputText`. The Converse API is required for Amazon Nova models and uses a structured `messages` array with `system` prompt.
 
-Pattern:
+**Analyze pattern** (single-turn, JSON output):
 ```python
 response = bedrock.converse(
     modelId=MODEL_ID,
@@ -204,7 +210,20 @@ response = bedrock.converse(
 output = response["output"]["message"]["content"][0]["text"]
 ```
 
-The analyze Lambda instructs the model to return a JSON array and strips markdown fences if present before parsing. The chat Lambda passes the full conversation history as the `messages` array for multi-turn support.
+The analyze Lambda instructs the model to return a JSON array and strips markdown fences if present before parsing.
+
+**Chat pattern** (multi-turn, natural language output):
+```python
+response = bedrock.converse(
+    modelId=MODEL_ID,
+    system=[{"text": system_prompt}],
+    messages=converse_messages,  # full conversation history
+    inferenceConfig={"maxTokens": 1024, "temperature": 0.3, "topP": 0.9},
+)
+reply = response["output"]["message"]["content"][0]["text"]
+```
+
+The chat Lambda passes the full conversation history as the `messages` array for multi-turn support. The system prompt instructs the model to format responses as: summary → optional bullets → citation on its own line prefixed with `📎`.
 
 ### API Gateway 29-Second Limit
 
@@ -213,7 +232,7 @@ API Gateway REST APIs have a hard 29-second integration timeout. To stay within 
 - `maxTokens` is capped at 1024
 - Lambda memory is 256MB (more memory = more CPU = faster boto3/Bedrock calls)
 
-Lambda Function URLs were also provisioned as a fallback (90s timeout, no API Gateway limit), but are currently blocked by an account-level SCP. The frontend currently routes through API Gateway.
+Lambda Function URLs are also provisioned in Terraform as a fallback (90s timeout, no API Gateway limit), but are currently blocked by an account-level SCP. The frontend routes all traffic through API Gateway.
 
 ---
 
@@ -229,7 +248,14 @@ Table: `ocg-portal-ocgs`
 
 Billing mode: PAY_PER_REQUEST (on-demand).
 
-The table is seeded with 3 sample OCGs via `aws dynamodb batch-write-item`. The content field contains the full OCG as a single string with section headers like `Section 4.2(a) — Permitted Billable Activities` followed by the section text.
+### Seed Data
+
+The table is seeded with 3 sample OCGs via `aws dynamodb batch-write-item --request-items file://infra/_seed_ocg.json`. The content field contains the full OCG as a single string with section headers like `Section 4.2(a) — Permitted Billable Activities` followed by the section text.
+
+Current OCGs:
+- `ocg-001`: Acme Corp — Outside Counsel Guidelines 2026 (12 sections)
+- `ocg-002`: Globex Inc — Billing & Staffing Guidelines v3 (8 sections)
+- `ocg-003`: Initech — Approved Task & Rate Schedule (7 sections)
 
 ---
 
@@ -243,14 +269,21 @@ The table is seeded with 3 sample OCGs via `aws dynamodb batch-write-item`. The 
 - Callback URLs: `http://localhost:5173`, `https://d19dntnemluddo.cloudfront.net`
 - Logout URLs: same as callback
 
-### Frontend Auth Flow
+### Frontend Auth Flow (`auth.js`)
 
 1. On load, `handleCallback()` checks the URL hash for `id_token` (Cognito redirect) and stores it in `sessionStorage`
-2. `getToken()` retrieves the token from `sessionStorage`
-3. `isAuthenticated()` decodes the JWT and checks `exp` claim
-4. Every API request attaches the token as the `Authorization` header
-5. On 401 response, `redirectToLogin()` sends the user to the Cognito hosted UI
-6. `logout()` clears `sessionStorage` and redirects to Cognito logout endpoint
+2. `getToken()` retrieves the raw token from `sessionStorage`
+3. `isAuthenticated()` decodes the JWT and checks `exp` claim against `Date.now()`
+4. `tokenMinutesLeft()` returns minutes until expiry (used by session warning banner)
+5. Every API request checks `isAuthenticated()` before calling — if expired, redirects to Cognito login via `redirectAndHalt()` (returns a never-resolving promise to prevent downstream catch blocks from firing)
+6. On 401 or 403 response from API, same redirect-and-halt behavior
+7. On `fetch` NetworkError (e.g., CORS preflight failure from expired token), checks `isAuthenticated()` and redirects if expired
+8. `logout()` clears `sessionStorage` and redirects to Cognito logout endpoint
+9. A background timer checks token expiry every 30 seconds and shows a yellow warning banner when < 5 minutes remain, with a "Refresh Session" button
+
+### Token Lifetime
+
+Cognito implicit flow tokens expire after 1 hour (default). There is no refresh token in implicit flow. When the token expires, the user must re-authenticate through the Cognito Hosted UI. If the Cognito session cookie is still valid, this is instant (no login screen).
 
 ### API Gateway Authorization
 
@@ -281,27 +314,30 @@ The UI follows the Cooley ARB design system documented in `.kiro/steering/ui-sty
 
 | Component | Purpose |
 |---|---|
-| `App` | Root — state management, OCG selector, layout, modal orchestration |
+| `App` | Root — state management, OCG selector, layout, modal orchestration, session expiry banner |
 | `TimecardEntry` | Single timecard line-item form (description textarea + hours input) |
-| `FeedbackBox` | Colored result box below each entry (green=billable, red=flagged) |
-| `ChatCitation` | Parses section references in chat messages into clickable links |
-| `OcgChatPanel` | Collapsible chat interface for OCG Q&A |
-| `OcgViewerModal` | Full-screen modal showing OCG sections with citation highlighting |
+| `FeedbackBox` | Colored result box below each entry (green=billable, red=flagged) with clickable citation |
+| `ChatCitation` | Parses section references in chat messages into clickable links (handles both `📎`-prefixed and inline `Section X.X` patterns) |
+| `OcgChatPanel` | Collapsible chat interface for OCG Q&A with typing indicator |
+| `OcgViewerModal` | Full-screen modal showing OCG sections with citation highlighting and auto-scroll |
 
 ### Key UI Behaviors
 
-1. OCG selector dropdown — populated from `GET /ocgs` API (falls back to mock data)
-2. Switching OCGs resets all timecard entries, chat messages, and cached viewer data
-3. Timecard entries — starts with 1 blank entry, "Add Line Item" button appends more, entries can be removed (minimum 1)
-4. "Analyze Entries" button — sends all valid entries to `POST /analyze`, displays feedback inline below each entry
-5. Feedback boxes — green (likely billable) or red (potential issue) with confidence badge, explanation, quoted OCG text, and clickable citation
-6. Chat panel — collapsible, appears below the analyze button, only enabled when an OCG is selected
-7. Citation clicking — both feedback citations and chat citations open the OCG Viewer Modal, which auto-scrolls to the cited section and highlights it with a red border + "CITED" badge
-8. Citation detection in chat — matches lines starting with `📎` OR containing `Section X.X` patterns anywhere in the text. Standalone citation lines render as full clickable buttons; inline references render as clickable inline links within the sentence.
+1. **OCG selector** — populated from `GET /ocgs` API, falls back to hardcoded mock list if API fails
+2. **OCG switching** — resets all timecard entries (back to 1 blank), clears chat messages and input, collapses chat panel, clears cached OCG viewer data
+3. **Timecard entries** — starts with 1 blank entry, "+ Add Line Item" button appends more, entries removable (minimum 1)
+4. **Analyze** — sends all valid entries to `POST /analyze`, displays feedback inline below each entry
+5. **Feedback boxes** — green (likely billable) or red (potential issue) with confidence badge, explanation, quoted OCG text, and clickable citation
+6. **Chat panel** — collapsible, appears below the analyze button, only enabled when an OCG is selected. Supports multi-turn conversation.
+7. **Chat response format** — LLM is prompted to return: 1-2 sentence summary, optional bullet points, citation on its own line with `📎` prefix
+8. **Citation clicking** — both feedback citations and chat citations open the OCG Viewer Modal, which auto-scrolls to the cited section and highlights it with a red border + "CITED" badge
+9. **Citation detection in chat** — matches lines starting with `📎` OR containing `Section X.X` patterns. Standalone citation lines render as full clickable buttons; inline references render as clickable inline links. Buttons use `type="button"` and `e.stopPropagation()` to prevent event bubbling issues.
+10. **Session expiry banner** — yellow warning bar appears when token has < 5 minutes left, with "Refresh Session" button
+11. **Sign Out** — ghost-style button in nav bar, clears session and redirects to Cognito logout
 
 ### OCG Viewer Modal
 
-- Fetches OCG content via `GET /ocgs/{id}` (falls back to `MOCK_OCG_CONTENT`)
+- Uses `MOCK_OCG_CONTENT` (hardcoded section-level data for all 3 OCGs) since no `GET /ocgs/{id}` endpoint exists yet
 - Renders each section as a card with `data-section-id` attribute
 - On open with an anchor, uses `querySelector` + `scrollIntoView` with a 100ms delay
 - Highlighted section gets: red left border, red-light background, "CITED" badge
@@ -331,39 +367,45 @@ aws s3 sync dist/ s3://ocg-portal-frontend-173051740680 --delete --region us-eas
 aws cloudfront create-invalidation --distribution-id E1F2SJ94LZF781 --paths "/*" --region us-east-1
 ```
 
-### Environment Variables (baked at build time)
+### Environment Variables (baked at build time via `.env.production`)
 
-| Variable | Value |
-|---|---|
-| `VITE_API_BASE_URL` | `https://lomyk2u8sa.execute-api.us-east-1.amazonaws.com/prod` |
-| `VITE_COGNITO_DOMAIN` | `https://ocg-portal.auth.us-east-1.amazoncognito.com` |
-| `VITE_COGNITO_CLIENT_ID` | `43qii8es4oimqtlfkigffb734o` |
-| `VITE_REDIRECT_URI` | `https://d19dntnemluddo.cloudfront.net` |
+| Variable | Value | Used By |
+|---|---|---|
+| `VITE_API_BASE_URL` | `https://lomyk2u8sa.execute-api.us-east-1.amazonaws.com/prod` | API client for all endpoints |
+| `VITE_COGNITO_DOMAIN` | `https://ocg-portal.auth.us-east-1.amazoncognito.com` | Auth redirects |
+| `VITE_COGNITO_CLIENT_ID` | `43qii8es4oimqtlfkigffb734o` | Auth redirects |
+| `VITE_REDIRECT_URI` | `https://d19dntnemluddo.cloudfront.net` | Cognito callback |
+
+Note: `VITE_ANALYZE_URL` and `VITE_CHAT_URL` (Lambda Function URLs) are also in `.env.production` but are not currently used by the frontend — all traffic routes through API Gateway.
 
 ---
 
-## Known Constraints
+## Known Constraints & Lessons Learned
 
-1. API Gateway REST API has a hard 29-second timeout. Bedrock calls with large OCG content can approach this limit. Prompts are kept concise and `maxTokens` capped at 1024 to stay within bounds.
-2. Lambda Function URLs are provisioned in Terraform but blocked by an account-level SCP (403 on invocation). They exist as infrastructure but the frontend routes through API Gateway.
-3. The DynamoDB table stores OCG content as a single string field. There is no structured section-level storage — the LLM parses sections from the raw text.
-4. The frontend `MOCK_OCG_CONTENT` object contains section-level data for the OCG Viewer Modal. When the real `GET /ocgs/{id}` API returns structured sections, the mock can be removed.
-5. Chat conversation history is held in React state only — it is not persisted. Refreshing the page or switching OCGs clears it.
+1. **API Gateway 29-second hard limit** — Bedrock calls must complete within this window. Prompts are kept concise and `maxTokens` capped at 1024. Lambda memory at 256MB helps (more CPU).
+2. **API Gateway deployment staleness** — Terraform's `aws_api_gateway_deployment` does not automatically redeploy when routes change. A `triggers` block with a hash of all integration/method IDs is required to force redeployment. Without this, new routes (like `/chat`) can exist in the config but return 403 `MissingAuthenticationTokenException` on OPTIONS preflight because the live stage points to an old deployment.
+3. **Lambda Function URLs blocked by SCP** — The AWS account has a Service Control Policy that blocks Lambda Function URL invocations (403 Forbidden). Function URLs are provisioned in Terraform but unused. All traffic goes through API Gateway.
+4. **Cognito implicit flow — no refresh tokens** — Tokens expire after 1 hour. The frontend handles this with: pre-request `isAuthenticated()` check, NetworkError catch with auth check, 401/403 auto-redirect, and a proactive session expiry warning banner.
+5. **Redirect-and-halt pattern** — When the token is expired and a redirect is needed, the API client returns `new Promise(() => {})` (a never-resolving promise) instead of throwing. This prevents downstream catch blocks from displaying error messages before the browser navigates to Cognito login.
+6. **Bedrock Converse API required** — Amazon Nova models (`amazon.nova-lite-v1:0`) require the Converse API (`bedrock.converse()`), not the legacy `invoke_model` with `inputText`. Using the wrong API returns `ValidationException: required key [messages] not found`.
+7. **OCG Viewer uses frontend mock data** — No `GET /ocgs/{id}` endpoint exists. The viewer modal uses `MOCK_OCG_CONTENT` (hardcoded section-level data for all 3 OCGs). This must be kept in sync with the DynamoDB seed data.
+8. **Chat conversation history is ephemeral** — Held in React state only. Refreshing the page or switching OCGs clears it.
+9. **CORS integration response ordering** — API Gateway integration responses for OPTIONS must use `depends_on` referencing both the method response and the integration, otherwise Terraform may try to create them before their dependencies exist, causing `BadRequestException: Invalid mapping expression`.
 
 ---
 
 ## Future Features
 
-- OCG upload and ingestion pipeline — allow users to upload PDF/DOCX OCG documents, extract text, chunk into sections, and store in DynamoDB. Could use S3 for raw file storage + a processing Lambda with textract or a PDF parsing library.
-- Bedrock Knowledge Bases integration — index OCGs into a Bedrock Knowledge Base for RAG-based retrieval instead of passing the full document in every prompt. Would improve response quality and reduce token usage/latency.
-- Structured section storage in DynamoDB — store OCG sections as a list of objects (`{id, title, text}`) rather than a flat string. This would make the OCG Viewer Modal work from real API data instead of relying on frontend mock content.
-- GET /ocgs/{id} endpoint — return full OCG content with structured sections for the viewer modal. Currently only `GET /ocgs` (list) exists.
-- Persistent chat history — store conversation sessions in DynamoDB keyed by user + OCG, so users can resume conversations across sessions.
-- Batch analysis export — allow users to export analysis results as CSV or PDF for attachment to billing submissions.
-- Timekeeper rate validation — extend the analysis to check whether billed hours × rate exceed OCG rate caps.
-- Multi-entry analysis optimization — currently all entries are sent in a single prompt. For large batches (10+ entries), split into parallel Lambda invocations to stay within the 29-second API Gateway limit.
-- OCG diff/comparison view — compare two OCG versions side-by-side to identify changes in billing rules.
-- Admin interface for OCG management — CRUD operations for OCGs with a dedicated admin role in Cognito.
-- Streaming responses — use Bedrock's streaming Converse API with Lambda response streaming to show chat responses as they generate, improving perceived latency.
-- Audit logging — log all analysis requests and results to a separate DynamoDB table or S3 for compliance and review.
-- User activity tracking — record which OCGs are queried most, common timecard descriptions, and rejection patterns to surface billing training opportunities.
+- **OCG upload and ingestion pipeline** — Allow users to upload PDF/DOCX OCG documents, extract text, chunk into sections, and store in DynamoDB. Could use S3 for raw file storage + a processing Lambda with Textract or a PDF parsing library.
+- **Bedrock Knowledge Bases integration** — Index OCGs into a Bedrock Knowledge Base for RAG-based retrieval instead of passing the full document in every prompt. Would improve response quality and reduce token usage/latency.
+- **Structured section storage in DynamoDB** — Store OCG sections as a list of objects (`{id, title, text}`) rather than a flat string. This would make the OCG Viewer Modal work from real API data instead of relying on frontend mock content.
+- **GET /ocgs/{id} endpoint** — Return full OCG content with structured sections for the viewer modal. Would eliminate the need for `MOCK_OCG_CONTENT` in the frontend.
+- **Persistent chat history** — Store conversation sessions in DynamoDB keyed by user + OCG, so users can resume conversations across sessions.
+- **Batch analysis export** — Allow users to export analysis results as CSV or PDF for attachment to billing submissions.
+- **Timekeeper rate validation** — Extend the analysis to check whether billed hours × rate exceed OCG rate caps.
+- **Multi-entry analysis optimization** — Currently all entries are sent in a single prompt. For large batches (10+ entries), split into parallel Lambda invocations to stay within the 29-second API Gateway limit.
+- **OCG diff/comparison view** — Compare two OCG versions side-by-side to identify changes in billing rules.
+- **Admin interface for OCG management** — CRUD operations for OCGs with a dedicated admin role in Cognito.
+- **Streaming responses** — Use Bedrock's streaming Converse API with Lambda response streaming to show chat responses as they generate, improving perceived latency.
+- **Audit logging** — Log all analysis requests and results to a separate DynamoDB table or S3 for compliance and review.
+- **User activity tracking** — Record which OCGs are queried most, common timecard descriptions, and rejection patterns to surface billing training opportunities.
