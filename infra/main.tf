@@ -495,7 +495,32 @@ resource "aws_api_gateway_deployment" "deploy" {
     aws_api_gateway_integration.options_ocgs,
     aws_api_gateway_integration.options_analyze,
     aws_api_gateway_integration.options_chat,
+    aws_api_gateway_integration_response.options_ocgs,
+    aws_api_gateway_integration_response.options_analyze,
+    aws_api_gateway_integration_response.options_chat,
   ]
+
+  # Force new deployment when any route config changes
+  triggers = {
+    redeployment = sha1(jsonencode([
+      aws_api_gateway_integration.get_ocgs.id,
+      aws_api_gateway_integration.post_analyze.id,
+      aws_api_gateway_integration.post_chat.id,
+      aws_api_gateway_integration.options_ocgs.id,
+      aws_api_gateway_integration.options_analyze.id,
+      aws_api_gateway_integration.options_chat.id,
+      aws_api_gateway_method.get_ocgs.id,
+      aws_api_gateway_method.post_analyze.id,
+      aws_api_gateway_method.post_chat.id,
+      aws_api_gateway_method.options_ocgs.id,
+      aws_api_gateway_method.options_analyze.id,
+      aws_api_gateway_method.options_chat.id,
+    ]))
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_api_gateway_stage" "prod" {
