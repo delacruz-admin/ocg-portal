@@ -1,14 +1,23 @@
 import { getToken, redirectToLogin, isAuthenticated } from '../auth';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
-const ANALYZE_URL = import.meta.env.VITE_ANALYZE_URL || '';
-const CHAT_URL = import.meta.env.VITE_CHAT_URL || '';
+
+// Returns a promise that never resolves — used after redirect to prevent
+// downstream catch blocks from firing before the browser navigates away
+function redirectAndHalt() {
+  redirectToLogin();
+  return new Promise(() => {});
+}
 
 async function request(path, options = {}) {
   const token = getToken();
   if (!token) {
-    redirectToLogin();
-    throw new Error('Not authenticated');
+    return redirectAndHalt();
+  }
+
+  // Check token expiry before making the call
+  if (!isAuthenticated()) {
+    return redirectAndHalt();
   }
 
   let res;
@@ -22,18 +31,15 @@ async function request(path, options = {}) {
       },
     });
   } catch (fetchErr) {
-    // NetworkError usually means token expired and CORS preflight failed,
-    // or the connection was reset. Re-auth fixes most cases.
+    // NetworkError — likely expired token causing CORS preflight failure
     if (!isAuthenticated()) {
-      redirectToLogin();
-      throw new Error('Session expired — redirecting to login');
+      return redirectAndHalt();
     }
     throw fetchErr;
   }
 
-  if (res.status === 401) {
-    redirectToLogin();
-    throw new Error('Session expired');
+  if (res.status === 401 || res.status === 403) {
+    return redirectAndHalt();
   }
 
   if (!res.ok) {
