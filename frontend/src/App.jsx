@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { handleCallback, logout } from './auth';
+import { handleCallback, logout, redirectToLogin, tokenMinutesLeft } from './auth';
 import { listOcgs, getOcg, analyzeTimecard, chatOcg } from './api/client';
 
 // Mock data for local dev — remove when API is wired
@@ -27,6 +27,31 @@ const MOCK_OCG_CONTENT = {
       { id: 'section-8', title: 'Section 8 — Audit Rights', text: 'The Company reserves the right to audit all invoices and supporting documentation. The Firm shall retain all time records and expense receipts for a minimum of 5 years. The Company may engage a third-party auditor at its discretion.' },
     ],
   },
+  'ocg-002': {
+    name: 'Globex Inc — Billing & Staffing Guidelines v3',
+    sections: [
+      { id: 'section-1', title: 'Section 1 — Scope', text: 'These guidelines apply to all outside counsel engaged by Globex Inc. Compliance is mandatory and a condition of continued engagement.' },
+      { id: 'section-2', title: 'Section 2 — Approved Timekeepers', text: 'All timekeepers must be pre-approved by Globex legal operations. Substitutions require 5 business days written notice. Partners may not delegate substantive work to associates without client consent.' },
+      { id: 'section-3', title: 'Section 3 — Billing Increments', text: 'Time must be billed in 6-minute (0.1 hour) increments. Minimum billing per task is 0.1 hours. No rounding up beyond the actual time spent.' },
+      { id: 'section-4', title: 'Section 4 — Permitted Activities', text: 'Billable work includes: substantive legal research, drafting of legal documents, court and arbitration appearances, depositions, witness preparation, settlement negotiations, and regulatory filings.' },
+      { id: 'section-5', title: 'Section 5 — Prohibited Billing', text: 'The following may not be billed: travel time under 1 hour each way, internal firm conferences, invoice preparation, file management, proofreading by non-legal staff, and training of any kind.' },
+      { id: 'section-6', title: 'Section 6 — Staffing Limits', text: 'No more than one partner and one associate per hearing or meeting unless pre-approved. Conference calls with more than 3 firm attendees require justification.' },
+      { id: 'section-7', title: 'Section 7 — Expenses', text: 'All expenses over $250 require pre-approval. Photocopies at $0.10/page. No reimbursement for first-class or business-class travel. Hotel stays capped at $200/night.' },
+      { id: 'section-8', title: 'Section 8 — Invoice Submission', text: 'Invoices due within 45 days of month-end. Must use UTBMS task and activity codes. Narrative descriptions required for all entries over 0.5 hours.' },
+    ],
+  },
+  'ocg-003': {
+    name: 'Initech — Approved Task & Rate Schedule',
+    sections: [
+      { id: 'section-1', title: 'Section 1 — Purpose', text: 'This schedule defines the approved tasks, rates, and billing practices for all outside counsel retained by Initech.' },
+      { id: 'section-2', title: 'Section 2 — Rate Caps', text: 'Partner rate cap: $750/hour. Senior associate cap: $500/hour. Junior associate cap: $350/hour. Paralegal cap: $200/hour. Rates exceeding caps will be automatically reduced.' },
+      { id: 'section-3', title: 'Section 3 — Approved Task Categories', text: 'Category A (Billable): Case assessment and strategy, legal research, document drafting, court appearances, depositions, mediation/arbitration, regulatory compliance work. Category B (Conditionally Billable — requires pre-approval): Expert witness coordination, e-discovery management, multi-jurisdictional coordination, legislative monitoring. Category C (Non-Billable): Administrative tasks, file management, billing preparation, internal meetings, CLE attendance, travel under 90 minutes.' },
+      { id: 'section-4', title: 'Section 4 — Block Billing', text: 'Block billing is strictly prohibited. Each time entry must describe one discrete task. Entries combining multiple tasks will be reduced by 30%.' },
+      { id: 'section-5', title: 'Section 5 — Staffing', text: 'Maximum 2 attorneys per proceeding without approval. Work should be performed at the lowest competent level. Partners should not perform associate-level work.' },
+      { id: 'section-6', title: 'Section 6 — Technology Charges', text: 'No charges for standard technology (email, word processing, legal research databases). Specialized software or e-discovery platforms require pre-approval and itemized billing.' },
+      { id: 'section-7', title: 'Section 7 — Reporting', text: 'Monthly accrual reports due by the 5th business day. Quarterly budget variance reports required. Matter budgets must be updated within 10 days of material changes.' },
+    ],
+  },
 };
 
 function createEntry() {
@@ -46,29 +71,39 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  const [sessionExpiring, setSessionExpiring] = useState(false);
 
   useEffect(() => {
     handleCallback();
     listOcgs()
       .then((data) => setOcgs(data.ocgs || data))
       .catch(() => setOcgs(MOCK_OCGS));
+    // Check token expiry every 30 seconds
+    const interval = setInterval(() => {
+      const mins = tokenMinutesLeft();
+      setSessionExpiring(mins > 0 && mins < 5);
+      if (mins === 0 && sessionStorage.getItem('id_token')) {
+        setSessionExpiring(true);
+      }
+    }, 30000);
+    return () => clearInterval(interval);
   }, []);
 
   const openOcgViewer = useCallback(async (citationId) => {
     if (!selectedOcg) return;
-    // Try API first, fall back to mock
     let ocgData = viewerOcg;
     if (!ocgData || ocgData.id !== selectedOcg) {
-      try {
-        ocgData = await getOcg(selectedOcg);
-      } catch {
-        ocgData = MOCK_OCG_CONTENT[selectedOcg] || null;
+      ocgData = MOCK_OCG_CONTENT[selectedOcg] || null;
+      if (!ocgData) {
+        // Build a minimal viewer from the OCG name
+        const ocgEntry = ocgs.find((o) => o.id === selectedOcg);
+        ocgData = { name: ocgEntry?.name || selectedOcg, sections: [] };
       }
-      if (ocgData) setViewerOcg({ ...ocgData, id: selectedOcg });
+      setViewerOcg({ ...ocgData, id: selectedOcg });
     }
     setViewerAnchor(citationId || null);
     setViewerOpen(true);
-  }, [selectedOcg, viewerOcg]);
+  }, [selectedOcg, viewerOcg, ocgs]);
 
   const updateEntry = useCallback((id, field, value) => {
     setEntries((prev) => prev.map((e) => (e.id === id ? { ...e, [field]: value } : e)));
@@ -158,6 +193,21 @@ export default function App() {
           </button>
         </div>
       </nav>
+
+      {/* Session expiry warning */}
+      {sessionExpiring && (
+        <div className="bg-yellow-bg border-b border-yellow-bd px-8 py-2 flex items-center justify-between animate-fade-in">
+          <span className="text-[0.78rem] text-yellow">
+            ⏱️ Your session is expiring soon. Re-authenticate to avoid interruptions.
+          </span>
+          <button
+            onClick={redirectToLogin}
+            className="text-[0.74rem] font-semibold text-yellow bg-transparent border-[1.5px] border-yellow rounded-cooley px-3 py-0.5 cursor-pointer transition-colors duration-150 hover:bg-yellow hover:text-white"
+          >
+            Refresh Session
+          </button>
+        </div>
+      )}
 
       {/* Page header */}
       <div className="bg-white border-b border-border py-6">
@@ -424,7 +474,8 @@ function ChatCitation({ line, onCitationClick }) {
   if (line.startsWith('📎') || cleanLine.trim().toLowerCase().startsWith('section')) {
     return (
       <button
-        onClick={() => onCitationClick?.(sectionId)}
+        type="button"
+        onClick={(e) => { e.stopPropagation(); onCitationClick?.(sectionId); }}
         className="flex items-center gap-1.5 bg-transparent border-none cursor-pointer p-0 group inline-flex"
       >
         <span className="text-[0.7rem] text-txt-muted">📎</span>
@@ -448,7 +499,8 @@ function ChatCitation({ line, onCitationClick }) {
       <span>
         {before}
         <button
-          onClick={() => onCitationClick?.(sectionId)}
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onCitationClick?.(sectionId); }}
           className="bg-transparent border-none cursor-pointer p-0 inline"
         >
           <span className="font-mono text-[0.72rem] text-red font-medium hover:underline">📎 {citation}</span>

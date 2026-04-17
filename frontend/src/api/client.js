@@ -1,4 +1,4 @@
-import { getToken, redirectToLogin } from '../auth';
+import { getToken, redirectToLogin, isAuthenticated } from '../auth';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 const ANALYZE_URL = import.meta.env.VITE_ANALYZE_URL || '';
@@ -11,14 +11,25 @@ async function request(path, options = {}) {
     throw new Error('Not authenticated');
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: token,
-      ...options.headers,
-    },
-  });
+  let res;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: token,
+        ...options.headers,
+      },
+    });
+  } catch (fetchErr) {
+    // NetworkError usually means token expired and CORS preflight failed,
+    // or the connection was reset. Re-auth fixes most cases.
+    if (!isAuthenticated()) {
+      redirectToLogin();
+      throw new Error('Session expired — redirecting to login');
+    }
+    throw fetchErr;
+  }
 
   if (res.status === 401) {
     redirectToLogin();

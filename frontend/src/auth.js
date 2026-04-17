@@ -17,6 +17,19 @@ export function isAuthenticated() {
   }
 }
 
+/** Returns minutes until token expires, or 0 if expired/missing */
+export function tokenMinutesLeft() {
+  const token = getToken();
+  if (!token) return 0;
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]));
+    const ms = payload.exp * 1000 - Date.now();
+    return Math.max(0, Math.floor(ms / 60000));
+  } catch {
+    return 0;
+  }
+}
+
 export function redirectToLogin() {
   const url = `${COGNITO_DOMAIN}/login?response_type=token&client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=openid+email+profile`;
   window.location.href = url;

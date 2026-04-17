@@ -34,7 +34,15 @@ OCG: "{ocg_name}"
 {ocg_text}
 ---
 
-Rules: Answer based ONLY on the OCG above. Cite sections using format: 📎 Section X.X — Title. Be concise."""
+Response format (follow exactly):
+1. Start with a 1-2 sentence summary answer.
+2. If helpful, add bullet points with key details. Use "•" for bullets, one per line.
+3. End with the citation on its own line, formatted exactly as: 📎 Section X.X — Title
+
+Rules:
+- Answer based ONLY on the OCG above.
+- Always end with exactly one citation line starting with 📎.
+- Keep answers concise."""
 
     # Build Converse API messages array
     converse_messages = []
